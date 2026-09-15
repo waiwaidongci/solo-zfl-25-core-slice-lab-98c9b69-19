@@ -80,18 +80,19 @@ let nesting = null;
 async function loadNesting() {
   if (!existsSync(nestingPath)) {
     await mkdir(dirname(nestingPath), { recursive: true });
-    nesting = JSON.parse(JSON.stringify(nestingSeed));
-    await saveNesting();
+    await saveNesting(JSON.parse(JSON.stringify(nestingSeed)));
     return;
   }
   nesting = JSON.parse(await readFile(nestingPath, "utf8"));
 }
 
-// 原子写：先写临时文件再改名，崩溃也不会留下写了一半的方案文件。
-async function saveNesting() {
+// 原子写 + 先持久化后提交：临时文件写入并改名成功后，才把候选状态提交为内存状态；
+// 写入或改名失败时，内存中的版本、录入与当前方案保持原样（与磁盘一致）。
+async function saveNesting(next) {
   const tmp = nestingPath + ".tmp";
-  await writeFile(tmp, JSON.stringify(nesting, null, 2));
+  await writeFile(tmp, JSON.stringify(next, null, 2));
   await rename(tmp, nestingPath);
+  nesting = next;
 }
 
 // 所有排样写操作串行执行：配合 baseVersion 乐观锁，并发重排仅一次成功。
@@ -121,9 +122,9 @@ function nestingStateJson() {
   };
 }
 
-// 在串行队列内执行：校验版本 → 求解 → 落库。任何一步失败都不改动现有状态，
-// 因此失败不会留下部分方案（回滚语义）。
-function doRelayout(input) {
+// 在串行队列内执行：校验版本 → 求解 → 构造候选状态落盘 → 提交内存。
+// 任何一步失败都不改动现有内存状态，因此失败不会留下部分方案（回滚语义）。
+async function doRelayout(input) {
   if (!input || input.baseVersion !== nesting.currentVersion) {
     throw { status: 409, body: { error: "version_conflict", currentVersion: nesting.currentVersion } };
   }
@@ -139,19 +140,18 @@ function doRelayout(input) {
     objective: result.plan.objective,
     plan: result.plan
   };
-  nesting.versions.push(version);
-  nesting.currentVersion = version.version;
-  return saveNesting().then(() => ({ ok: true, version: version.version, plan: version.plan }));
+  const next = { ...nesting, versions: [...nesting.versions, version], currentVersion: version.version };
+  await saveNesting(next); // 持久化失败时抛出，内存版本与方案保持不变
+  return { ok: true, version: version.version, plan: version.plan };
 }
 
-function doUpdateInputs(raw) {
+async function doUpdateInputs(raw) {
   const normalized = normalizeInputs(raw);
   const errors = validateInputs(normalized);
   if (errors.length) throw { status: 422, body: { error: "invalid_inputs", details: errors } };
-  nesting.params = normalized.params;
-  nesting.segments = normalized.segments;
-  nesting.sliceSpecs = normalized.sliceSpecs;
-  return saveNesting().then(() => nestingStateJson());
+  const next = { ...nesting, params: normalized.params, segments: normalized.segments, sliceSpecs: normalized.sliceSpecs };
+  await saveNesting(next); // 持久化失败时抛出，内存录入保持不变
+  return nestingStateJson();
 }
 
 const page = `<!doctype html>

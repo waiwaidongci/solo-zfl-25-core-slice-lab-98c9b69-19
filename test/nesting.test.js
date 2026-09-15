@@ -1,8 +1,9 @@
 // 原芯裁切排样实测：启动真实服务，通过 HTTP 验证
 // 缺陷不可跨越、边界（锯缝/端头损耗/最短余料/加长吸废料）、并列最优编号稳定、
-// 必切保留、并发仅一次成功、失败回滚不留部分方案、重启不丢、旧入口保留。
+// 必切保留、并发仅一次成功、失败回滚（含真实磁盘写入/改名/目录不可写失败）、
+// 重启不丢、旧入口保留。
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, rmdir, chmod, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,6 +62,8 @@ const slice = (id, minLen, maxLen, over = {}) => ({ id, minLen, maxLen, methods:
 
 async function main() {
   const dataDir = await mkdtemp(join(tmpdir(), "nesting-test-"));
+  const nestingFile = join(dataDir, "core-nesting.json");
+  const nestingTmp = nestingFile + ".tmp";
   let child = await startServer(dataDir);
   try {
     // 0. 首次启动：种子数据自动排出版本 1
@@ -195,18 +198,38 @@ async function main() {
       ok("必切保留；同数量下高优先级优先");
     }
 
-    // 5. 并发重排：仅一次成功，失败不留部分方案
+    // 5. 并发重排：5 路并发仅一次成功，失败不留部分方案
     {
       const before = await getState();
-      const [r1, r2] = await Promise.all([relayout(before.currentVersion), relayout(before.currentVersion)]);
-      const statuses = [r1.status, r2.status].sort();
-      assert.deepEqual(statuses, [200, 409], "并发重排应恰好一次 200 一次 409");
-      const loser = r1.status === 409 ? r1 : r2;
-      assert.equal(loser.data.error, "version_conflict");
+      const results = await Promise.all(Array.from({ length: 5 }, () => relayout(before.currentVersion)));
+      const oks = results.filter((r) => r.status === 200);
+      const conflicts = results.filter((r) => r.status === 409);
+      assert.equal(oks.length, 1, "5 路并发重排应恰好一次 200");
+      assert.equal(conflicts.length, 4, "其余应为 409 版本冲突");
+      assert.ok(conflicts.every((r) => r.data.error === "version_conflict"));
       const after = await getState();
       assert.equal(after.currentVersion, before.currentVersion + 1, "版本号只应前进 1");
       assert.equal(after.versions.length, before.versions.length + 1, "只应新增一个版本");
-      ok("并发重排仅一次成功（200+409），版本只前进 1");
+      const onDisk = JSON.parse(await readFile(nestingFile, "utf8"));
+      assert.equal(onDisk.currentVersion, after.currentVersion, "磁盘与内存版本一致");
+      ok("并发重排（5 路）仅一次成功，版本只前进 1，磁盘一致");
+    }
+
+    // 5b. 并发混发：保存录入与重排同时到达，均被串行化且状态一致
+    {
+      const before = await getState();
+      const newInputs = base({ segments: [seg("MIX", 200)], sliceSpecs: [slice("M1", 50, 50)] });
+      const [putRes, layRes] = await Promise.all([putInputs(newInputs), relayout(before.currentVersion)]);
+      assert.equal(putRes.status, 200, "并发下保存录入应成功");
+      assert.equal(layRes.status, 200, "并发下重排应成功（串行化后各自基于正确版本）");
+      const after = await getState();
+      assert.equal(after.currentVersion, before.currentVersion + 1, "版本只前进 1");
+      assert.deepEqual(after.segments, newInputs.segments, "录入最终为新值");
+      assert.deepEqual(after.sliceSpecs.map((s) => s.id), ["M1"]);
+      const onDisk = JSON.parse(await readFile(nestingFile, "utf8"));
+      assert.equal(onDisk.currentVersion, after.currentVersion, "磁盘与内存版本一致");
+      assert.deepEqual(onDisk.segments, after.segments, "磁盘与内存录入一致");
+      ok("并发混发保存录入+重排：串行化成功，内存与磁盘一致");
     }
 
     // 6a. 回滚：必切片排不下 → 排样失败，状态不变
@@ -242,15 +265,87 @@ async function main() {
       ok("回滚：非法录入被拒绝且原录入不变");
     }
 
-    // 7. 重启不丢 + 旧入口保留
+    // 7. 磁盘写入失败（临时文件路径被目录占用）：500，内存与磁盘均不变，恢复后正常递增
+    {
+      await putInputs(base({ segments: [seg("S1", 100)], sliceSpecs: [slice("A", 40, 40)] }));
+      const before = await getState();
+      await mkdir(nestingTmp); // 让 writeFile(tmp) 以 EISDIR 失败
+      try {
+        const res = await relayoutCurrent();
+        assert.equal(res.status, 500, "写入失败应返回 500");
+        const after = await getState();
+        assert.equal(after.currentVersion, before.currentVersion, "写入失败后内存版本号不得前进");
+        assert.deepEqual(after.versions, before.versions, "写入失败后版本列表不变");
+        assert.deepEqual(after.plan, before.plan, "写入失败后当前方案不变");
+        const onDisk = JSON.parse(await readFile(nestingFile, "utf8"));
+        assert.equal(onDisk.currentVersion, before.currentVersion, "磁盘版本号保持原样");
+        assert.equal(onDisk.versions.length, before.versions.length, "磁盘版本列表保持原样");
+      } finally {
+        await rmdir(nestingTmp);
+      }
+      const res2 = await relayoutCurrent();
+      assert.equal(res2.status, 200, "故障恢复后重排应成功");
+      assert.equal(res2.data.version, before.currentVersion + 1, "恢复后版本号只前进 1（无跳号）");
+      ok("磁盘写入失败：500 且内存/磁盘均不变，恢复后正常递增");
+    }
+
+    // 7b. 改名失败（目标文件被目录占用）：500，内存不变，磁盘原文件未被替换
+    {
+      const before = await getState();
+      const backup = await readFile(nestingFile, "utf8");
+      await rm(nestingFile);
+      await mkdir(nestingFile); // rename(tmp, dir) 将以 EISDIR 失败
+      try {
+        const res = await relayoutCurrent();
+        assert.equal(res.status, 500, "改名失败应返回 500");
+        const after = await getState();
+        assert.equal(after.currentVersion, before.currentVersion, "改名失败后内存版本号不得前进");
+        assert.deepEqual(after.versions, before.versions, "改名失败后版本列表不变");
+        assert.deepEqual(after.plan, before.plan, "改名失败后当前方案不变");
+      } finally {
+        await rmdir(nestingFile);
+        await writeFile(nestingFile, backup); // 还原磁盘原文件
+      }
+      const onDisk = JSON.parse(await readFile(nestingFile, "utf8"));
+      assert.equal(onDisk.currentVersion, before.currentVersion, "磁盘版本未被失败请求改动");
+      const res2 = await relayoutCurrent();
+      assert.equal(res2.status, 200, "故障恢复后重排应成功");
+      assert.equal(res2.data.version, before.currentVersion + 1, "恢复后版本号只前进 1");
+      ok("改名失败：500 且内存/磁盘均不变，恢复后正常递增");
+    }
+
+    // 7c. 数据目录不可写（chmod 0555）：保存录入与重排都不得改动内存状态
+    {
+      const before = await getState();
+      await chmod(dataDir, 0o555);
+      try {
+        const res = await relayoutCurrent();
+        assert.equal(res.status, 500, "目录不可写时重排应返回 500");
+        const res2 = await putInputs(base({ segments: [seg("RO", 100)], sliceSpecs: [slice("X", 10, 10)] }));
+        assert.equal(res2.status, 500, "目录不可写时保存录入应返回 500");
+        const after = await getState();
+        assert.equal(after.currentVersion, before.currentVersion, "目录不可写时内存版本号不得前进");
+        assert.deepEqual(after.segments, before.segments, "目录不可写时内存录入不得改变");
+        assert.deepEqual(after.plan, before.plan, "目录不可写时当前方案不变");
+      } finally {
+        await chmod(dataDir, 0o755);
+      }
+      const res3 = await relayoutCurrent();
+      assert.equal(res3.status, 200, "恢复可写后重排应成功");
+      assert.equal(res3.data.version, before.currentVersion + 1, "恢复后版本号只前进 1");
+      ok("数据目录不可写：保存与重排均 500 且状态不变，恢复后正常");
+    }
+
+    // 8. 重启不丢（含磁盘失败恢复后的一致性）+ 旧入口保留
     {
       const before = await getState();
       await stopServer(child);
       child = await startServer(dataDir);
       const after = await getState();
-      assert.equal(after.currentVersion, before.currentVersion, "重启后版本号不丢");
-      assert.deepEqual(after.versions, before.versions, "重启后版本列表不丢");
-      assert.deepEqual(after.segments, before.segments, "重启后录入不丢");
+      assert.deepEqual(after, before, "重启后内存状态应与重启前完全一致");
+      const onDisk = JSON.parse(await readFile(nestingFile, "utf8"));
+      assert.equal(onDisk.currentVersion, after.currentVersion, "磁盘与内存版本一致");
+      assert.equal(onDisk.versions.length, after.versions.length, "磁盘与内存版本数一致");
       const v1 = await api("/api/nesting/versions/1");
       assert.equal(v1.status, 200);
       assert.ok(v1.data.plan.objective, "历史版本可回看");
@@ -264,12 +359,13 @@ async function main() {
       const nesting = await fetch(BASE + "/nesting");
       assert.equal(nesting.status, 200);
       assert.match(await nesting.text(), /原芯裁切排样/, "排样页面可访问");
-      ok("重启不丢（版本/录入/方案），旧入口与新页面均可用");
+      ok("重启不丢（全状态一致），旧入口与新页面均可用");
     }
 
     console.log(`\n全部 ${passed} 组实测通过`);
   } finally {
     await stopServer(child);
+    await chmod(dataDir, 0o755).catch(() => {});
     await rm(dataDir, { recursive: true, force: true });
   }
 }
