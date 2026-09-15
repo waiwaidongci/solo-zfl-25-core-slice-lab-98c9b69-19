@@ -1,0 +1,216 @@
+{
+  "params": {
+    "kerf": 2,
+    "endLoss": 5,
+    "minRemnant": 30
+  },
+  "segments": [
+    {
+      "id": "SEG-01",
+      "length": 400,
+      "defects": [
+        {
+          "start": 150,
+          "end": 170,
+          "kind": "裂隙"
+        },
+        {
+          "start": 300,
+          "end": 320,
+          "kind": "污染"
+        }
+      ]
+    },
+    {
+      "id": "SEG-02",
+      "length": 260,
+      "defects": []
+    }
+  ],
+  "sliceSpecs": [
+    {
+      "id": "P-01",
+      "minLen": 60,
+      "maxLen": 80,
+      "methods": [
+        "金刚石锯"
+      ],
+      "priority": 5,
+      "required": true
+    },
+    {
+      "id": "P-02",
+      "minLen": 45,
+      "maxLen": 55,
+      "methods": [
+        "金刚石锯",
+        "线锯"
+      ],
+      "priority": 3,
+      "required": false
+    },
+    {
+      "id": "P-03",
+      "minLen": 50,
+      "maxLen": 60,
+      "methods": [
+        "线锯"
+      ],
+      "priority": 4,
+      "required": false
+    },
+    {
+      "id": "P-04",
+      "minLen": 40,
+      "maxLen": 50,
+      "methods": [
+        "金刚石锯"
+      ],
+      "priority": 2,
+      "required": false
+    }
+  ],
+  "versions": [
+    {
+      "version": 1,
+      "at": "2026-09-15T16:08:48.707Z",
+      "inputsHash": "6689889",
+      "objective": {
+        "placed": 4,
+        "prioritySum": 14,
+        "waste": 16,
+        "cuts": 5,
+        "kerfLoss": 6,
+        "remnantWaste": 0,
+        "remnantUsable": 49
+      },
+      "plan": {
+        "objective": {
+          "placed": 4,
+          "prioritySum": 14,
+          "waste": 16,
+          "cuts": 5,
+          "kerfLoss": 6,
+          "remnantWaste": 0,
+          "remnantUsable": 49
+        },
+        "params": {
+          "kerf": 2,
+          "endLoss": 5,
+          "minRemnant": 30
+        },
+        "segments": [
+          {
+            "id": "SEG-01",
+            "length": 400,
+            "usableStart": 5,
+            "usableEnd": 395,
+            "defects": [
+              {
+                "start": 150,
+                "end": 170,
+                "kind": "裂隙"
+              },
+              {
+                "start": 300,
+                "end": 320,
+                "kind": "污染"
+              }
+            ],
+            "endLossWaste": 10,
+            "defectWaste": 40,
+            "used": false,
+            "windows": [
+              {
+                "start": 5,
+                "end": 150,
+                "remnant": null
+              },
+              {
+                "start": 170,
+                "end": 300,
+                "remnant": null
+              },
+              {
+                "start": 320,
+                "end": 395,
+                "remnant": null
+              }
+            ],
+            "placements": []
+          },
+          {
+            "id": "SEG-02",
+            "length": 260,
+            "usableStart": 5,
+            "usableEnd": 255,
+            "defects": [],
+            "endLossWaste": 10,
+            "defectWaste": 0,
+            "used": true,
+            "windows": [
+              {
+                "start": 5,
+                "end": 255,
+                "remnant": {
+                  "start": 206,
+                  "end": 255,
+                  "usable": true
+                }
+              }
+            ],
+            "placements": [
+              {
+                "sliceId": "P-01",
+                "segmentId": "SEG-02",
+                "windowIndex": 0,
+                "start": 5,
+                "end": 65,
+                "length": 60,
+                "method": "金刚石锯",
+                "required": true,
+                "priority": 5
+              },
+              {
+                "sliceId": "P-03",
+                "segmentId": "SEG-02",
+                "windowIndex": 0,
+                "start": 67,
+                "end": 117,
+                "length": 50,
+                "method": "线锯",
+                "required": false,
+                "priority": 4
+              },
+              {
+                "sliceId": "P-02",
+                "segmentId": "SEG-02",
+                "windowIndex": 0,
+                "start": 119,
+                "end": 164,
+                "length": 45,
+                "method": "金刚石锯",
+                "required": false,
+                "priority": 3
+              },
+              {
+                "sliceId": "P-04",
+                "segmentId": "SEG-02",
+                "windowIndex": 0,
+                "start": 166,
+                "end": 206,
+                "length": 40,
+                "method": "金刚石锯",
+                "required": false,
+                "priority": 2
+              }
+            ]
+          }
+        ],
+        "unplaced": [],
+        "notes": []
+      }
+    }
+  ],
+  "currentVersion": 1
+}

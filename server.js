@@ -1,11 +1,15 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { solveLayout, normalizeInputs, validateInputs } from "./solver.js";
+import { nestingPage } from "./nesting-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "core-slices.json");
+const dataDir = process.env.DATA_DIR || join(__dirname, "data");
+const dbPath = join(dataDir, "core-slices.json");
+const nestingPath = join(dataDir, "core-nesting.json");
 const port = Number(process.env.PORT || 3025);
 const statuses = ["待切割", "制片中", "待观察", "已交付"];
 const taskSteps = ["取样", "切割", "研磨", "染色", "观察"];
@@ -53,6 +57,103 @@ function updateSampleStatus(sample) {
   else sample.status = "待切割";
 }
 
+// ---------- 原芯裁切排样：状态、持久化与并发 ----------
+
+const nestingSeed = {
+  params: { kerf: 2, endLoss: 5, minRemnant: 30 },
+  segments: [
+    { id: "SEG-01", length: 400, defects: [ { start: 150, end: 170, kind: "裂隙" }, { start: 300, end: 320, kind: "污染" } ] },
+    { id: "SEG-02", length: 260, defects: [] }
+  ],
+  sliceSpecs: [
+    { id: "P-01", minLen: 60, maxLen: 80, methods: ["金刚石锯"], priority: 5, required: true },
+    { id: "P-02", minLen: 45, maxLen: 55, methods: ["金刚石锯", "线锯"], priority: 3, required: false },
+    { id: "P-03", minLen: 50, maxLen: 60, methods: ["线锯"], priority: 4, required: false },
+    { id: "P-04", minLen: 40, maxLen: 50, methods: ["金刚石锯"], priority: 2, required: false }
+  ],
+  versions: [],
+  currentVersion: 0
+};
+
+let nesting = null;
+
+async function loadNesting() {
+  if (!existsSync(nestingPath)) {
+    await mkdir(dirname(nestingPath), { recursive: true });
+    nesting = JSON.parse(JSON.stringify(nestingSeed));
+    await saveNesting();
+    return;
+  }
+  nesting = JSON.parse(await readFile(nestingPath, "utf8"));
+}
+
+// 原子写：先写临时文件再改名，崩溃也不会留下写了一半的方案文件。
+async function saveNesting() {
+  const tmp = nestingPath + ".tmp";
+  await writeFile(tmp, JSON.stringify(nesting, null, 2));
+  await rename(tmp, nestingPath);
+}
+
+// 所有排样写操作串行执行：配合 baseVersion 乐观锁，并发重排仅一次成功。
+let nestingQueue = Promise.resolve();
+function enqueueNesting(fn) {
+  const run = nestingQueue.then(fn);
+  nestingQueue = run.catch(() => {});
+  return run;
+}
+
+function inputsHash() {
+  const text = JSON.stringify({ params: nesting.params, segments: nesting.segments, sliceSpecs: nesting.sliceSpecs });
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) >>> 0;
+  return hash.toString(16);
+}
+
+function nestingStateJson() {
+  const latest = nesting.versions[nesting.versions.length - 1] || null;
+  return {
+    params: nesting.params,
+    segments: nesting.segments,
+    sliceSpecs: nesting.sliceSpecs,
+    currentVersion: nesting.currentVersion,
+    versions: nesting.versions.map(v => ({ version: v.version, at: v.at, objective: v.objective, inputsHash: v.inputsHash })),
+    plan: latest ? latest.plan : null
+  };
+}
+
+// 在串行队列内执行：校验版本 → 求解 → 落库。任何一步失败都不改动现有状态，
+// 因此失败不会留下部分方案（回滚语义）。
+function doRelayout(input) {
+  if (!input || input.baseVersion !== nesting.currentVersion) {
+    throw { status: 409, body: { error: "version_conflict", currentVersion: nesting.currentVersion } };
+  }
+  const result = solveLayout({ params: nesting.params, segments: nesting.segments, sliceSpecs: nesting.sliceSpecs });
+  if (!result.ok) {
+    if (result.stage === "validation") throw { status: 422, body: { error: "invalid_inputs", details: result.errors } };
+    throw { status: 422, body: { error: "layout_infeasible", conflicts: result.conflicts } };
+  }
+  const version = {
+    version: nesting.currentVersion + 1,
+    at: new Date().toISOString(),
+    inputsHash: inputsHash(),
+    objective: result.plan.objective,
+    plan: result.plan
+  };
+  nesting.versions.push(version);
+  nesting.currentVersion = version.version;
+  return saveNesting().then(() => ({ ok: true, version: version.version, plan: version.plan }));
+}
+
+function doUpdateInputs(raw) {
+  const normalized = normalizeInputs(raw);
+  const errors = validateInputs(normalized);
+  if (errors.length) throw { status: 422, body: { error: "invalid_inputs", details: errors } };
+  nesting.params = normalized.params;
+  nesting.segments = normalized.segments;
+  nesting.sliceSpecs = normalized.sliceSpecs;
+  return saveNesting().then(() => nestingStateJson());
+}
+
 const page = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -63,6 +164,7 @@ const page = `<!doctype html>
     :root { --bg:#f1f3ef; --panel:#fff; --ink:#242822; --muted:#687062; --line:#d7ddd1; --accent:#526f43; --stone:#73706a; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
     header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:16px; }
+    nav { display:flex; gap:14px; align-items:center; } a { color:var(--accent); font-weight:700; text-decoration:none; }
     h1 { margin:0; font-size:26px; } main { display:grid; grid-template-columns:390px 1fr; gap:22px; padding:22px 28px; }
     form,.panel,.card,.stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px; } h2 { margin:0 0 12px; font-size:18px; }
     label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
@@ -75,7 +177,7 @@ const page = `<!doctype html>
   </style>
 </head>
 <body>
-  <header><div><h1>岩芯样本切片实验室</h1><div class="meta">样本、切片任务、制片步骤和交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>岩芯样本切片实验室</h1><div class="meta">样本、切片任务、制片步骤和交付</div></div><nav><a href="/nesting">原芯裁切排样 →</a><button id="reload">刷新</button></nav></header>
   <main>
     <form id="form">
       <h2>创建岩芯样本</h2>
@@ -141,11 +243,32 @@ const page = `<!doctype html>
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
       return res.end(page);
     }
+    if (req.method === "GET" && url.pathname === "/nesting") {
+      res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
+      return res.end(nestingPage);
+    }
+    // ---------- 排样 API ----------
+    if (req.method === "GET" && url.pathname === "/api/nesting/state") return sendJson(res, 200, nestingStateJson());
+    if (req.method === "PUT" && url.pathname === "/api/nesting/inputs") {
+      const input = await body(req);
+      return sendJson(res, 200, await enqueueNesting(() => doUpdateInputs(input)));
+    }
+    if (req.method === "POST" && url.pathname === "/api/nesting/relayout") {
+      const input = await body(req);
+      return sendJson(res, 200, await enqueueNesting(() => doRelayout(input)));
+    }
+    const versionMatch = url.pathname.match(/^\/api\/nesting\/versions\/(\d+)$/);
+    if (req.method === "GET" && versionMatch) {
+      const rec = nesting.versions.find(v => v.version === Number(versionMatch[1]));
+      if (!rec) return sendJson(res, 404, { error: "version_not_found" });
+      return sendJson(res, 200, rec);
+    }
+    // ---------- 旧样本 API（保持不变） ----------
+    const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/api/samples") return sendJson(res, 200, db.samples);
     if (req.method === "POST" && url.pathname === "/api/samples") {
       const input = await body(req);
@@ -190,8 +313,15 @@ const server = http.createServer(async (req, res) => {
     }
     sendJson(res, 404, { error: "not_found" });
   } catch (error) {
+    if (error && error.status) return sendJson(res, error.status, error.body);
     sendJson(res, 500, { error: error.message });
   }
 });
+
+await loadNesting();
+// 首次启动（或录入被清空重建）时自动排一版，页面打开即有示例方案。
+if (nesting.versions.length === 0 && (nesting.segments.length || nesting.sliceSpecs.length)) {
+  try { await enqueueNesting(() => doRelayout({ baseVersion: nesting.currentVersion })); } catch { /* 种子数据不可行时保持空方案 */ }
+}
 
 server.listen(port, () => console.log(`Core slice lab app listening on http://localhost:${port}`));
